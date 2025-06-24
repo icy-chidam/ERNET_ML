@@ -15,16 +15,17 @@ def get_stock_data(ticker='AAPL', start='2017-01-01', end='2022-12-31'):
     return df['Close'].values.reshape(-1, 1)
 
 # ----------------- Quantum Circuit -----------------
-n_qubits = 4
+n_qubits = 6
 dev = qml.device("default.qubit", wires=n_qubits)
 
 def quantum_circuit(inputs, weights):
     for i in range(n_qubits):
-        qml.RX(inputs[i], wires=i)
+        qml.RX(inputs[i % inputs.shape[0]], wires=i)
         qml.RY(weights[i][0], wires=i)
         qml.RZ(weights[i][1], wires=i)
     for i in range(n_qubits - 1):
         qml.CNOT(wires=[i, i + 1])
+    qml.CNOT(wires=[n_qubits - 1, 0])  # ring entanglement
     return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
 
 weight_shapes = {"weights": (n_qubits, 2)}
@@ -39,10 +40,10 @@ qlayer = qml.qnn.TorchLayer(qnode, weight_shapes)
 class QLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(QLSTM, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.quantum = qlayer
         self.fc1 = nn.Linear(input_dim, n_qubits)
+        self.quantum = qlayer
         self.lstm = nn.LSTM(n_qubits, hidden_dim)
+        self.dropout = nn.Dropout(0.3)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
@@ -50,14 +51,15 @@ class QLSTM(nn.Module):
         q_out = []
 
         for t in range(seq_len):
-            xt = x[:, t, :]                      # shape: (batch_size, input_dim)
-            xt = self.fc1(xt)                    # shape: (batch_size, n_qubits)
-            qt = torch.stack([self.quantum(sample) for sample in xt])  # Apply quantum layer per sample
+            xt = x[:, t, :]                          # shape: (batch_size, input_dim)
+            xt = self.fc1(xt)                        # shape: (batch_size, n_qubits)
+            qt = torch.stack([self.quantum(sample) for sample in xt])  # per sample
             q_out.append(qt)
 
-        q_out = torch.stack(q_out, dim=1)        # shape: (batch_size, seq_len, n_qubits)
-        out, _ = self.lstm(q_out)                # shape: (batch_size, seq_len, hidden_dim)
-        out = self.fc2(out[:, -1, :])            # take last time step
+        q_out = torch.stack(q_out, dim=1)            # shape: (batch_size, seq_len, n_qubits)
+        out, _ = self.lstm(q_out)                    # shape: (batch_size, seq_len, hidden_dim)
+        out = self.dropout(out)
+        out = self.fc2(out[:, -1, :])                # last time step
         return out
 
 # ----------------- Sequence Preprocessing -----------------
@@ -71,9 +73,9 @@ def create_sequences(data, seq_length):
     return np.array(xs), np.array(ys)
 
 # ----------------- Training -----------------
-def train_model(model, X_train, y_train, epochs=20):
+def train_model(model, X_train, y_train, epochs=150):
     loss_fn = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     for epoch in range(epochs):
         model.train()
         output = model(X_train)
@@ -93,12 +95,8 @@ if __name__ == '__main__':
     seq_length = 10
     X, y = create_sequences(data_scaled, seq_length)
 
-    # Convert to tensors
     X = torch.tensor(X, dtype=torch.float32)
-    y = torch.tensor(y, dtype=torch.float32)
-
-    # Reshape y to 2D
-    y = y.view(-1, 1)
+    y = torch.tensor(scaler.transform(y.reshape(-1, 1)), dtype=torch.float32)
 
     # Train-test split
     split = int(0.8 * len(X))
@@ -106,22 +104,22 @@ if __name__ == '__main__':
     y_train, y_test = y[:split], y[split:]
 
     # Model and training
-    model = QLSTM(input_dim=1, hidden_dim=8, output_dim=1)
-    train_model(model, X_train, y_train, epochs=10)  # You can increase epochs
+    model = QLSTM(input_dim=1, hidden_dim=12, output_dim=1)
+    train_model(model, X_train, y_train, epochs=150)
 
     # Evaluation
     model.eval()
     with torch.no_grad():
         predictions = model(X_test).numpy()
     predictions = scaler.inverse_transform(predictions)
-    y_test = scaler.inverse_transform(y_test.numpy())
+    y_test_inv = scaler.inverse_transform(y_test.numpy())
 
     # Plot
     plt.figure(figsize=(10, 5))
     plt.plot(predictions, label='Predicted')
-    plt.plot(y_test, label='Actual')
+    plt.plot(y_test_inv, label='Actual')
     plt.legend()
-    plt.title("Stock Price Prediction with QLSTM")
+    plt.title("Stock Price Prediction with Optimized QLSTM")
     plt.xlabel("Time")
     plt.ylabel("Price")
     plt.grid()
